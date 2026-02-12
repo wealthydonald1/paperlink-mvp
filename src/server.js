@@ -1,6 +1,9 @@
+// src/server.js
 import "dotenv/config";
 import express from "express";
+import multer from "multer";
 import { nanoid } from "nanoid";
+
 import {
   insertFile,
   getFileById,
@@ -9,30 +12,33 @@ import {
   setMaxDownloads,
   revokeFile,
 } from "./db.js";
+
 import {
   forwardToStorage,
   sendMessage,
   getFile,
   sendDocumentToStorage,
+  answerCallback,
+  editMessage,
+  kb,
 } from "./telegram.js";
-import multer from "multer";
 
 const app = express();
 app.use(express.json());
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB for now
-});
-
-// ngrok warning skip
+// ngrok warning skip (nice)
 app.use((req, res, next) => {
   res.setHeader("ngrok-skip-browser-warning", "true");
   next();
 });
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // can be outdated on ngrok restart
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // may change with ngrok
 const STORAGE_CHAT_ID = process.env.STORAGE_CHAT_ID;
 const PORT = Number(process.env.PORT || 3000);
 
@@ -40,7 +46,6 @@ if (!BOT_TOKEN || !STORAGE_CHAT_ID) {
   console.error("Missing env vars: BOT_TOKEN, STORAGE_CHAT_ID");
 }
 
-// Use request host as fallback (helps when ngrok URL changes)
 function baseUrlFromReq(req) {
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -60,7 +65,7 @@ function fmtBytes(bytes) {
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)}${units[i]}`;
 }
 
-// Telegram sometimes sends /command@BotName
+// /LIST or /list@PaperLinkBot -> "/list"
 function normalizeCommand(text) {
   const t = (text || "").trim();
   if (!t.startsWith("/")) return t;
@@ -68,6 +73,10 @@ function normalizeCommand(text) {
   const parts = t.split(/\s+/);
   const cmd = parts[0].replace(/@[\w_]+/g, "").toLowerCase();
   return [cmd, ...parts.slice(1)].join(" ").trim();
+}
+
+function safeFilename(name) {
+  return String(name || "file").replace(/[/\\?%*:|"<>]/g, "_");
 }
 
 function pickIncomingFile(update) {
@@ -78,7 +87,6 @@ function pickIncomingFile(update) {
   if (msg.video) return { file: msg.video, message: msg };
   if (msg.audio) return { file: msg.audio, message: msg };
 
-  // photos come as array sizes; pick biggest
   if (msg.photo?.length) {
     const largest = msg.photo[msg.photo.length - 1];
     return {
@@ -94,112 +102,82 @@ function pickIncomingFile(update) {
   return null;
 }
 
+function itemKeyboard(id) {
+  return kb([
+    [
+      { text: "🔗 Open", callback_data: `o:${id}` },
+      { text: "⚙️ Limit", callback_data: `lm:${id}` },
+      { text: "🛑 Revoke", callback_data: `rv:${id}` },
+    ],
+  ]);
+}
+
 async function handleCommand(message, reqBaseUrl) {
   const raw = (message.text || "").trim();
   const text = normalizeCommand(raw);
 
-  const ownerUserId = String(message.chat.id);
-  if (!ownerUserId) {
-  await sendMessage(BOT_TOKEN, fromChatId, "Could not determine owner for this chat.");
-  return res.status(200).send("no owner");
-}
-
+  const ownerUserId = String(message.from?.id || "");
   const chatId = message.chat.id;
 
   console.log("CMD:", text, "chatId:", chatId, "owner:", ownerUserId);
 
-  if (!ownerUserId) {
-    await sendMessage(BOT_TOKEN, chatId, "No owner id found.");
-    return true;
-  }
-
-  // /list
   if (text === "/list") {
     const rows = listFilesByOwner.all(ownerUserId, 10);
 
     if (!rows.length) {
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        "📁 No links yet.\nSend/forward a file to me and I’ll generate a link."
-      );
+      await sendMessage(BOT_TOKEN, chatId, "📁 No links yet.\nSend me a file and I’ll create a link.");
       return true;
     }
 
-    const lines = rows.map((r) => {
+    await sendMessage(BOT_TOKEN, chatId, "📁 Your links (last 10)");
+
+    for (const r of rows) {
       const used = Number(r.download_count || 0);
       const max = r.max_downloads == null ? "∞" : String(r.max_downloads);
       const link = `${reqBaseUrl}/s/${r.id}`;
-      return `• ${r.file_name} (${fmtBytes(r.file_size)}) — ${used}/${max}\n  ${link}`;
-    });
 
-    await sendMessage(BOT_TOKEN, chatId, `📁 Your links:\n\n${lines.join("\n\n")}`);
+      const line1 = `${r.file_name || "file"} • ${used}/${max} • ${fmtBytes(r.file_size)}`;
+
+      await sendMessage(BOT_TOKEN, chatId, `${line1}\n${link}`, itemKeyboard(r.id));
+    }
+
     return true;
   }
 
-  // /limit <id> <n>
+  // Keep old typed commands as fallback (power users)
+  if (text.startsWith("/revoke")) {
+    const parts = text.split(/\s+/);
+    const id = parts[1];
+    if (!id) {
+      await sendMessage(BOT_TOKEN, chatId, "Usage: /revoke <shareId>\nTip: use /list and tap buttons.");
+      return true;
+    }
+    const result = revokeFile.run(id, ownerUserId);
+    await sendMessage(BOT_TOKEN, chatId, result.changes ? `🛑 Revoked ${id}` : "Could not revoke (wrong id or not yours).");
+    return true;
+  }
+
   if (text.startsWith("/limit")) {
     const parts = text.split(/\s+/);
     const id = parts[1];
-    const n = Number(parts[2]);
+    const n = parts[2] === "inf" ? null : Number(parts[2]);
 
-    if (!id || !Number.isFinite(n) || n < 1) {
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        "Usage: /limit <shareId> <number>\nExample: /limit abc123 5"
-      );
+    if (!id || (parts[2] !== "inf" && (!Number.isFinite(n) || n < 1))) {
+      await sendMessage(BOT_TOKEN, chatId, "Usage: /limit <shareId> <number|inf>\nExample: /limit abc123 5");
       return true;
     }
 
     const result = setMaxDownloads.run(n, id, ownerUserId);
-    if (result.changes === 0) {
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        "Could not update. Check the shareId (or it’s not yours)."
-      );
-      return true;
-    }
-
-    await sendMessage(BOT_TOKEN, chatId, `✅ Set max downloads for ${id} to ${n}.`);
+    await sendMessage(BOT_TOKEN, chatId, result.changes ? `✅ Limit updated: ${n === null ? "∞" : n}` : "Could not update (wrong id or not yours).");
     return true;
   }
 
-  // /revoke <id>
-  if (text.startsWith("/revoke")) {
-    const parts = text.split(/\s+/);
-    const id = parts[1];
-
-    if (!id) {
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        "Usage: /revoke <shareId>\nExample: /revoke abc123"
-      );
-      return true;
-    }
-
-    const result = revokeFile.run(id, ownerUserId);
-    if (result.changes === 0) {
-      await sendMessage(
-        BOT_TOKEN,
-        chatId,
-        "Could not revoke. Check the shareId (or it’s not yours)."
-      );
-      return true;
-    }
-
-    await sendMessage(BOT_TOKEN, chatId, `🛑 Revoked link ${id}.`);
-    return true;
-  }
-
-  // Unknown command → always reply
+  // Unknown command
   if (text.startsWith("/")) {
     await sendMessage(
       BOT_TOKEN,
       chatId,
-      "Commands:\n/list — show your links\n/limit <id> <n> — set max downloads\n/revoke <id> — disable a link"
+      "Commands:\n/list — show your links\n(then tap buttons)\n\nPower user:\n/limit <id> <n|inf>\n/revoke <id>"
     );
     return true;
   }
@@ -207,14 +185,131 @@ async function handleCommand(message, reqBaseUrl) {
   return false;
 }
 
-
 app.post("/telegram/webhook", async (req, res) => {
   try {
+    // 1) BUTTON TAPS
+    const cb = req.body.callback_query;
+    if (cb) {
+      const fromUserId = String(cb.from?.id || "");
+      const chatId = cb.message?.chat?.id;
+      const msgId = cb.message?.message_id;
+      const data = cb.data || "";
+
+      await answerCallback(BOT_TOKEN, cb.id);
+
+      if (!chatId || !msgId) {
+        res.status(200).send("ok");
+        return;
+      }
+
+      const [cmd, id] = data.split(":");
+
+      if (cmd === "o") {
+        const row = getFileById.get(id);
+        if (!row) {
+          await sendMessage(BOT_TOKEN, chatId, "Not found.");
+          res.status(200).send("ok");
+          return;
+        }
+        const reqBaseUrl = PUBLIC_BASE_URL || baseUrlFromReq(req);
+        await sendMessage(BOT_TOKEN, chatId, `🔗 ${reqBaseUrl}/s/${id}`);
+        res.status(200).send("ok");
+        return;
+      }
+
+      if (cmd === "lm") {
+        await editMessage(
+          BOT_TOKEN,
+          chatId,
+          msgId,
+          "Choose a download limit:",
+          kb([
+            [
+              { text: "5", callback_data: `l5:${id}` },
+              { text: "20", callback_data: `l20:${id}` },
+              { text: "∞", callback_data: `linf:${id}` },
+            ],
+            [{ text: "⬅ Back", callback_data: `bk:${id}` }],
+          ])
+        );
+        res.status(200).send("ok");
+        return;
+      }
+
+      if (cmd === "l5" || cmd === "l20" || cmd === "linf") {
+        const limit = cmd === "l5" ? 5 : cmd === "l20" ? 20 : null;
+        const result = setMaxDownloads.run(limit, id, fromUserId);
+
+        if (result.changes === 0) {
+          await sendMessage(BOT_TOKEN, chatId, "Could not update (not yours or wrong id).");
+          res.status(200).send("ok");
+          return;
+        }
+
+        await sendMessage(BOT_TOKEN, chatId, `✅ Limit updated: ${limit === null ? "∞" : limit}`);
+        res.status(200).send("ok");
+        return;
+      }
+
+      if (cmd === "rv") {
+        await editMessage(
+          BOT_TOKEN,
+          chatId,
+          msgId,
+          "Revoke this link? People won’t be able to download it anymore.",
+          kb([
+            [
+              { text: "✅ Yes revoke", callback_data: `rvy:${id}` },
+              { text: "Cancel", callback_data: `bk:${id}` },
+            ],
+          ])
+        );
+        res.status(200).send("ok");
+        return;
+      }
+
+      if (cmd === "rvy") {
+        const result = revokeFile.run(id, fromUserId);
+
+        if (result.changes === 0) {
+          await sendMessage(BOT_TOKEN, chatId, "Could not revoke (not yours or wrong id).");
+          res.status(200).send("ok");
+          return;
+        }
+
+        await editMessage(BOT_TOKEN, chatId, msgId, "🛑 Link revoked.");
+        res.status(200).send("ok");
+        return;
+      }
+
+      if (cmd === "bk") {
+        const row = getFileById.get(id);
+        if (!row) {
+          await editMessage(BOT_TOKEN, chatId, msgId, "Not found.");
+          res.status(200).send("ok");
+          return;
+        }
+
+        const used = Number(row.download_count || 0);
+        const max = row.max_downloads == null ? "∞" : String(row.max_downloads);
+        const reqBaseUrl = PUBLIC_BASE_URL || baseUrlFromReq(req);
+        const link = `${reqBaseUrl}/s/${id}`;
+        const line1 = `${row.file_name || "file"} • ${used}/${max} • ${fmtBytes(row.file_size)}`;
+
+        await editMessage(BOT_TOKEN, chatId, msgId, `${line1}\n${link}`, itemKeyboard(id));
+        res.status(200).send("ok");
+        return;
+      }
+
+      res.status(200).send("ok");
+      return;
+    }
+
+    // 2) NORMAL MESSAGES
     const msg = req.body.message || req.body.edited_message;
 
-    // Handle commands first
+    // Commands first
     if (msg?.text?.startsWith("/")) {
-      // safe log
       console.log("INCOMING COMMAND:", msg.text);
       const reqBaseUrl = PUBLIC_BASE_URL || baseUrlFromReq(req);
       const handled = await handleCommand(msg, reqBaseUrl);
@@ -222,37 +317,27 @@ app.post("/telegram/webhook", async (req, res) => {
       return;
     }
 
+    // File uploads from Telegram
     const extracted = pickIncomingFile(req.body);
-
-    // Not a file
     if (!extracted) {
       res.status(200).send("no file");
       return;
     }
 
     const { file, message } = extracted;
-
     const fromChatId = message.chat.id;
     const messageId = message.message_id;
 
-    // forward original message into storage channel
-    const storedMsg = await forwardToStorage(
-      BOT_TOKEN,
-      fromChatId,
-      messageId,
-      STORAGE_CHAT_ID
-    );
+    const storedMsg = await forwardToStorage(BOT_TOKEN, fromChatId, messageId, STORAGE_CHAT_ID);
 
     const shareId = nanoid(21);
 
-    // ownership + default rules
-    const ownerUserId = String(message.chat.id);
-    const maxDownloads = 20; // free default
-    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(); // 48h
+    const ownerUserId = String(message.from?.id || "");
+    const maxDownloads = 20;
+    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
 
     insertFile.run({
       id: shareId,
-
       owner_user_id: ownerUserId,
       max_downloads: maxDownloads,
       download_count: 0,
@@ -270,8 +355,8 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const reqBaseUrl = PUBLIC_BASE_URL || baseUrlFromReq(req);
     const link = `${reqBaseUrl}/s/${shareId}`;
-    await sendMessage(BOT_TOKEN, fromChatId, `✅ Saved!\nLink: ${link}`);
 
+    await sendMessage(BOT_TOKEN, fromChatId, `✅ Saved!\n${link}`);
     res.status(200).send("ok");
   } catch (e) {
     console.error("Webhook error:", e);
@@ -349,17 +434,15 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     );
 
     const doc = storedMsg.document;
-
     const shareId = nanoid(21);
 
-    // For now, web uploads have "web" owner. Later we’ll add login.
+    // web uploads owner placeholder
     const ownerUserId = "web";
     const maxDownloads = 20;
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
 
     insertFile.run({
       id: shareId,
-
       owner_user_id: ownerUserId,
       max_downloads: maxDownloads,
       download_count: 0,
@@ -407,7 +490,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Auto-download
 app.get("/s/:id", (req, res) => {
   res.redirect(`/d/${req.params.id}`);
 });
@@ -416,27 +498,17 @@ app.get("/d/:id", async (req, res) => {
   const row = getFileById.get(req.params.id);
   if (!row) return res.status(404).send("Not found");
 
-  // revoked?
-  if (Number(row.is_revoked || 0) === 1) {
-    return res.status(410).send("Link revoked");
-  }
+  if (Number(row.is_revoked || 0) === 1) return res.status(410).send("Link revoked");
 
-  // expired?
   if (row.expires_at) {
     const exp = new Date(row.expires_at).getTime();
-    if (!Number.isNaN(exp) && Date.now() > exp) {
-      return res.status(410).send("Link expired");
-    }
+    if (!Number.isNaN(exp) && Date.now() > exp) return res.status(410).send("Link expired");
   }
 
-  // download limit?
   const used = Number(row.download_count || 0);
   const max = row.max_downloads == null ? null : Number(row.max_downloads);
-  if (max !== null && used >= max) {
-    return res.status(429).send("Download limit reached");
-  }
+  if (max !== null && used >= max) return res.status(429).send("Download limit reached");
 
-  // count this download
   console.log("DOWNLOAD HIT:", req.params.id);
   incrementDownload.run(req.params.id);
 
@@ -447,10 +519,7 @@ app.get("/d/:id", async (req, res) => {
   if (!upstream.ok) return res.status(502).send("Telegram fetch failed");
 
   res.setHeader("Content-Type", row.mime_type || "application/octet-stream");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${safeFilename(row.file_name || "file")}"`
-  );
+  res.setHeader("Content-Disposition", `attachment; filename="${safeFilename(row.file_name)}"`);
 
   upstream.body.pipeTo(
     new WritableStream({
@@ -467,7 +536,3 @@ app.get("/d/:id", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log("Server running on port", PORT));
-
-function safeFilename(name) {
-  return String(name).replace(/[/\\?%*:|"<>]/g, "_");
-}

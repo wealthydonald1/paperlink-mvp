@@ -1,7 +1,9 @@
+// src/db.js
 import Database from "better-sqlite3";
 
-export const db = new Database("data.db");
+const db = new Database("data.db");
 
+// Create table (safe if exists)
 db.exec(`
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
@@ -12,28 +14,20 @@ db.exec(`
     file_name TEXT,
     mime_type TEXT,
     file_size INTEGER,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+
+    owner_user_id TEXT,
+    max_downloads INTEGER,
+    download_count INTEGER DEFAULT 0,
+    expires_at TEXT,
+    is_revoked INTEGER DEFAULT 0
   );
+
+  CREATE INDEX IF NOT EXISTS idx_files_owner_created
+  ON files(owner_user_id, created_at DESC);
 `);
 
-// --- migrations (safe to run; ignores "duplicate column" errors) ---
-function tryExec(sql) {
-  try {
-    db.exec(sql);
-  } catch (e) {
-    // ignore duplicate column errors
-    if (String(e?.message || "").includes("duplicate column name")) return;
-    throw e;
-  }
-}
-
-tryExec(`ALTER TABLE files ADD COLUMN owner_user_id TEXT;`);
-tryExec(`ALTER TABLE files ADD COLUMN max_downloads INTEGER;`);
-tryExec(`ALTER TABLE files ADD COLUMN download_count INTEGER DEFAULT 0;`);
-tryExec(`ALTER TABLE files ADD COLUMN expires_at TEXT;`);
-tryExec(`ALTER TABLE files ADD COLUMN is_revoked INTEGER DEFAULT 0;`);
-
-
+// ✅ IMPORTANT: do NOT require created_at param
 export const insertFile = db.prepare(`
   INSERT INTO files (
     id,
@@ -67,33 +61,33 @@ export const insertFile = db.prepare(`
 `);
 
 export const getFileById = db.prepare(`
-  SELECT * FROM files WHERE id = ?
-`);
-
-export const listFilesByOwner = db.prepare(`
-  SELECT id, file_name, file_size, download_count, max_downloads, created_at, expires_at, is_revoked
+  SELECT *
   FROM files
-  WHERE owner_user_id = ? AND is_revoked = 0
-  ORDER BY created_at DESC
-  LIMIT ?
-`);
-
-export const getActiveBytesByOwner = db.prepare(`
-  SELECT COALESCE(SUM(file_size), 0) AS total
-  FROM files
-  WHERE owner_user_id = ?
-    AND is_revoked = 0
-    AND (expires_at IS NULL OR expires_at > datetime('now'))
+  WHERE id = ?
 `);
 
 export const incrementDownload = db.prepare(`
-  UPDATE files SET download_count = download_count + 1 WHERE id = ?
+  UPDATE files
+  SET download_count = COALESCE(download_count, 0) + 1
+  WHERE id = ?
+`);
+
+export const listFilesByOwner = db.prepare(`
+  SELECT id, file_name, file_size, download_count, max_downloads, expires_at, is_revoked, created_at
+  FROM files
+  WHERE owner_user_id = ?
+  ORDER BY datetime(created_at) DESC
+  LIMIT ?
 `);
 
 export const setMaxDownloads = db.prepare(`
-  UPDATE files SET max_downloads = ? WHERE id = ? AND owner_user_id = ?
+  UPDATE files
+  SET max_downloads = ?
+  WHERE id = ? AND owner_user_id = ?
 `);
 
 export const revokeFile = db.prepare(`
-  UPDATE files SET is_revoked = 1 WHERE id = ? AND owner_user_id = ?
+  UPDATE files
+  SET is_revoked = 1
+  WHERE id = ? AND owner_user_id = ?
 `);
